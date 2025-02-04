@@ -1,218 +1,377 @@
-import json
 import pandas as pd
 import pandas_ta as ta
-import requests
 import numpy as np
+import requests
 import matplotlib.pyplot as plt
 from io import BytesIO
-import logging
-from datetime import datetime
-from config import TELEGRAM, COINS, INTERVAL, SECONDARY_INTERVAL, BINANCE_LIMIT, SUPPORT_RESISTANCE, debug_print
+from datetime import datetime, timedelta
+import json
+import os
+import sys
 
-def get_crypto_data(symbol, interval=INTERVAL):
+from config import (
+    TELEGRAM, SUPPORT_RESISTANCE, TRADING_PARAMS, ML_PARAMS,
+    BINANCE_LIMIT, SENTIMENT_ANALYSIS, debug_print
+)
+
+# For stacking ensemble and grid search tuning:
+from sklearn.ensemble import RandomForestRegressor, StackingRegressor
+from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import GridSearchCV, train_test_split
+from xgboost import XGBRegressor
+
+PREDICTION_HISTORY_FILE = "prediction_history.json"
+
+def get_crypto_data(symbol, interval):
+    base_url = "https://api.binance.com/api/v3/klines"
+    params = {
+        'symbol': symbol,
+        'interval': interval,
+        'limit': BINANCE_LIMIT
+    }
     try:
-        debug_print(f"Fetching {symbol} ({interval}) data...", level="info")
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={BINANCE_LIMIT}"
-        response = requests.get(url)
-        response.raise_for_status()
-        
+        debug_print(f"Fetching data for {symbol}...", "info")
+        response = requests.get(base_url, params=params, timeout=15)
+        if not response.ok:
+            debug_print(f"API Error {response.status_code} for {symbol}", "error")
+            return None
         data = response.json()
+        if len(data) < TRADING_PARAMS['MIN_DATA_POINTS']:
+            debug_print(f"Insufficient data points for {symbol}", "warning")
+            return None
         df = pd.DataFrame(data, columns=[
             'timestamp', 'open', 'high', 'low', 'close', 'volume',
             'close_time', 'quote_volume', 'trades', 'taker_buy_volume',
             'taker_quote_volume', 'ignore'
         ])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df = df.set_index('timestamp')
         numeric_cols = ['open', 'high', 'low', 'close', 'volume']
         df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
-        return df[['open', 'high', 'low', 'close', 'volume']]
+        df = df.set_index('timestamp')[numeric_cols].dropna()
+        return df.iloc[-BINANCE_LIMIT:]
     except Exception as e:
-        debug_print(f"Error fetching {symbol} data: {str(e)}", level="error")
+        debug_print(f"Data fetch failed for {symbol}: {str(e)}", "error")
         return None
 
-def calculate_advanced_indicators(df):
+def add_extra_indicators(df):
+    """
+    Adds extra technical indicators:
+      - Fibonacci retracement levels from the last 100 periods.
+      - Ichimoku Cloud using pandas_ta with add_suffix to avoid duplicate column names.
+      - Pivot Points using pandas_ta.
+    Returns updated df and a dict of Fibonacci levels.
+    """
     try:
-        if df is None or df.empty:
-            return None
-            
-        debug_print("Calculating technical indicators...", level="info")
-        df.ta.rsi(length=14, append=True)
-        df.ta.macd(append=True)
-        df.ta.bbands(length=20, append=True)
-        df.ta.ema(length=20, append=True)
-        df.ta.ema(length=50, append=True)
-        df.ta.obv(append=True)
-        df.ta.vwap(append=True)
-        return df.dropna()
+        # Fibonacci retracement levels
+        recent = df.tail(100)
+        high = recent['high'].max()
+        low = recent['low'].min()
+        diff = high - low
+        fib_levels = {
+            "Fib_23.6": high - 0.236 * diff,
+            "Fib_38.2": high - 0.382 * diff,
+            "Fib_50": high - 0.5 * diff,
+            "Fib_61.8": high - 0.618 * diff
+        }
+        # Ichimoku Cloud with add_suffix to avoid duplicate column names
+        ichimoku_df = df.ta.ichimoku()
+        ichimoku_df = ichimoku_df.add_suffix('_ichimoku')
+        df = df.join(ichimoku_df)
+        # Pivot Points (using a 14-period)
+        pivots = ta.pivots(df['high'], df['low'], df['close'], length=14)
+        df = df.join(pivots)
+        return df, fib_levels
     except Exception as e:
-        debug_print(f"Indicator error: {str(e)}", level="error")
+        debug_print(f"Extra indicator calculation failed: {str(e)}", "error")
+        return df, {}
+
+def calculate_advanced_indicators(df):
+    required_columns = ['open', 'high', 'low', 'close', 'volume']
+    if not all(col in df.columns for col in required_columns):
+        debug_print("Missing base columns for indicators", "error")
+        return None
+    try:
+        df = df.copy()
+        df['RSI_14'] = ta.rsi(df['close'], length=14)
+        macd_df = ta.macd(df['close'])
+        df['MACD'] = macd_df['MACD_12_26_9']
+        df['MACD_signal'] = macd_df['MACDs_12_26_9']
+        df['EMA_50'] = ta.ema(df['close'], length=50)
+        df['EMA_200'] = ta.ema(df['close'], length=200)
+        bbands = ta.bbands(df['close'], length=20)
+        df['BBU'] = bbands['BBU_20_2.0']
+        df['BBL'] = bbands['BBL_20_2.0']
+        df['BB_width'] = df['BBU'] - df['BBL']
+        df['ATR_14'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+        # Add extra indicators
+        df, fib_levels = add_extra_indicators(df)
+        df = df.dropna()
+        df.attrs['fib_levels'] = fib_levels
+        return df
+    except Exception as e:
+        debug_print(f"Indicator calculation failed: {str(e)}", "error")
         return None
 
 def calculate_support_resistance(df):
-    if df is None or df.empty:
-        return None
-        
     try:
-        cfg = SUPPORT_RESISTANCE
-        lookback = cfg['LOOKBACK_PERIODS']
+        if df.empty:
+            return None
         current_price = df['close'].iloc[-1]
-        
-        # Calculate Fibonacci levels
-        recent_high = df['high'].rolling(lookback).max().iloc[-1]
-        recent_low = df['low'].rolling(lookback).min().iloc[-1]
-        fib_levels = {
-            '0.236': recent_high - (recent_high - recent_low) * 0.236,
-            '0.382': recent_high - (recent_high - recent_low) * 0.382,
-            '0.5': recent_high - (recent_high - recent_low) * 0.5,
-            '0.618': recent_high - (recent_high - recent_low) * 0.618
-        }
-        
-        # Combine methods
-        levels = []
-        levels.extend(df['low'].rolling(lookback).min().iloc[-3:].tolist())
-        levels.extend(df['high'].rolling(lookback).max().iloc[-3:].tolist())
-        levels.extend(fib_levels.values())
-        
-        # Filter relevant levels
-        relevant_levels = [lvl for lvl in levels 
-                         if abs(lvl - current_price)/current_price <= cfg['RELEVANCE_THRESHOLD']]
-        
-        # Cluster levels
-        clustered = []
-        for level in sorted(relevant_levels):
-            if not clustered:
-                clustered.append(level)
-            else:
-                if abs(level - clustered[-1])/clustered[-1] > cfg['CLUSTER_TOLERANCE']:
-                    clustered.append(level)
-        
-        # Separate support/resistance
-        support = [lvl for lvl in clustered if lvl < current_price][:cfg['MAX_LEVELS']]
-        resistance = [lvl for lvl in clustered if lvl > current_price][:cfg['MAX_LEVELS']]
-        
+        lookback = min(SUPPORT_RESISTANCE['LOOKBACK_PERIODS'], len(df))
+        swing_highs = df['high'].rolling(lookback).max().dropna().tolist()
+        swing_lows = df['low'].rolling(lookback).min().dropna().tolist()
+        levels = swing_lows + swing_highs
+        levels = [lvl for lvl in levels if abs(lvl - current_price) / current_price <= SUPPORT_RESISTANCE['RELEVANCE_THRESHOLD']]
+        if len(levels) > 1:
+            from sklearn.cluster import KMeans
+            n_clusters = min(SUPPORT_RESISTANCE['MAX_LEVELS'], len(levels))
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init='auto')
+            clusters = kmeans.fit_predict(np.array(levels).reshape(-1, 1))
+            clustered = [round(np.mean([lvl for i, lvl in enumerate(levels) if clusters[i]==c]), 2) for c in set(clusters)]
+        else:
+            clustered = levels
+        support = [l for l in clustered if l < current_price]
+        resistance = [l for l in clustered if l > current_price]
         return {
-            'current_price': current_price,
-            'support': sorted(support, reverse=True),
-            'resistance': sorted(resistance),
-            'fib_levels': fib_levels
+            'current_price': round(current_price, 2),
+            'support': sorted(support, reverse=True)[:SUPPORT_RESISTANCE['MAX_LEVELS']],
+            'resistance': sorted(resistance)[:SUPPORT_RESISTANCE['MAX_LEVELS']]
         }
     except Exception as e:
-        debug_print(f"Support/Resistance error: {str(e)}", level="error")
+        debug_print(f"S/R calculation failed: {str(e)}", "error")
         return None
 
-def generate_chart(symbol, df, levels):
+def generate_chart(symbol, df, sr_levels, predicted_price=None):
     try:
         plt.style.use('dark_background')
-        fig, axes = plt.subplots(3, 1, figsize=(14, 12), gridspec_kw={'height_ratios': [3,1,1]})
-        
-        # Price Plot
-        ax1 = axes[0]
-        ax1.plot(df.index, df['close'], color='#00ff9d', linewidth=1.5, label='Price')
-        
-        # Plot support/resistance
-        if levels:
-            current_price = levels['current_price']
-            for sup in levels['support']:
-                ax1.axhline(sup, color='#00ff9d', linestyle='--', alpha=0.7, label='Support' if sup == levels['support'][0] else "")
-            for res in levels['resistance']:
-                ax1.axhline(res, color='#ff006a', linestyle='--', alpha=0.7, label='Resistance' if res == levels['resistance'][0] else "")
-            ax1.axhline(current_price, color='#ffffff', linestyle='-', linewidth=1, alpha=0.5, label='Current Price')
-            
-        # Bollinger Bands
-        if 'BBL_20_2.0' in df.columns:
-            ax1.fill_between(df.index, df['BBL_20_2.0'], df['BBU_20_2.0'], color='#2b2b2b', alpha=0.3)
-            ax1.plot(df.index, df['BBM_20_2.0'], color='#787878', linewidth=1, label='Bollinger Mid')
-            
-        ax1.set_title(f"{symbol} Price Analysis")
-        ax1.legend(loc='upper left')
-        ax1.grid(alpha=0.1)
-        
-        # RSI
-        axes[1].plot(df.index, df['RSI_14'], color='#ffcc00', linewidth=1)
-        axes[1].axhline(70, color='#ff006a', linestyle='--', alpha=0.7)
-        axes[1].axhline(30, color='#00ff9d', linestyle='--', alpha=0.7)
-        axes[1].fill_between(df.index, 30, 70, color='#2b2b2b', alpha=0.3)
-        axes[1].set_title("RSI (14)")
-        axes[1].grid(alpha=0.1)
-        
-        # MACD
-        axes[2].plot(df.index, df['MACD_12_26_9'], color='#00ff9d', linewidth=1, label='MACD')
-        axes[2].plot(df.index, df['MACDs_12_26_9'], color='#ff006a', linewidth=1, label='Signal')
-        axes[2].bar(df.index, df['MACDh_12_26_9'], 
-                   color=np.where(df['MACDh_12_26_9'] > 0, '#00ff9d', '#ff006a'), 
-                   alpha=0.5, width=0.01)
-        axes[2].set_title("MACD")
-        axes[2].grid(alpha=0.1)
-        axes[2].legend()
-        
-        plt.tight_layout()
+        fig, ax = plt.subplots(figsize=(14,7))
+        ax.plot(df.index, df['close'], label="Price", color="#00FF9D")
+        ax.plot(df.index, df['EMA_50'], label="EMA 50", color="#FF006A")
+        ax.plot(df.index, df['EMA_200'], label="EMA 200", color="#00FFFF")
+        # Plot Ichimoku Cloud if available
+        if 'ISA_9_ichimoku' in df.columns and 'ISB_26_ichimoku' in df.columns:
+            ax.fill_between(df.index, df['ISA_9_ichimoku'], df['ISB_26_ichimoku'], color='purple', alpha=0.2, label='Ichimoku Cloud')
+        if sr_levels:
+            for level in sr_levels.get('support', []):
+                ax.axhline(level, color="green", linestyle="--", alpha=0.7)
+            for level in sr_levels.get('resistance', []):
+                ax.axhline(level, color="red", linestyle="--", alpha=0.7)
+            ax.axhline(sr_levels['current_price'], color="white", linewidth=1, alpha=0.5)
+        if predicted_price is not None:
+            ax.axhline(predicted_price, color="orange", linestyle=":", linewidth=2)
+            ax.text(df.index[-1], predicted_price, f" Predicted: ${predicted_price:.2f}", color="orange", fontsize=10, verticalalignment="bottom")
+        ax.set_title(f"{symbol} Price Action", fontsize=14)
+        ax.legend(loc='upper left')
+        ax.grid(alpha=0.1)
         buf = BytesIO()
-        plt.savefig(buf, format='png', dpi=150, facecolor='#0e1116')
+        plt.savefig(buf, format='png', dpi=150, facecolor='#0E1116')
         buf.seek(0)
         plt.close()
         return buf
     except Exception as e:
-        debug_print(f"Chart error: {str(e)}", level="error")
+        debug_print(f"Chart generation failed: {str(e)}", "error")
         return None
 
-def generate_insights(symbol, df, levels):
+def generate_insights(symbol, df, sr_levels, fib_levels=None):
     try:
-        message = []
         current_price = df['close'].iloc[-1]
-        message.append(f"🔥 *{symbol} Technical Analysis* 🔥\n")
-        message.append(f"📈 Current Price: ${current_price:.2f}\n")
+        intraday_high = df['high'].max()
+        intraday_low = df['low'].min()
+        atr = df['ATR_14'].iloc[-1] if 'ATR_14' in df.columns else None
+        rsi = df['RSI_14'].iloc[-1] if 'RSI_14' in df.columns else None
+        macd_bullish = df['MACD'].iloc[-1] > df['MACD_signal'].iloc[-1]
+        ema_trend = df['EMA_50'].iloc[-1] > df['EMA_200'].iloc[-1]
+        trend = "Upward" if ema_trend else "Downward"
         
-        if levels:
-            message.append("*Support/Resistance Levels:*")
-            message.append("```")
-            message.append("Support Levels:")
-            for sup in levels['support']:
-                message.append(f"🟢 ${sup:.2f} ({(sup-current_price)/current_price*100:.1f}%)")
-            message.append("\nResistance Levels:")
-            for res in levels['resistance']:
-                message.append(f"🔴 ${res:.2f} ({(res-current_price)/current_price*100:.1f}%)")
-            message.append("```\n")
-            
-        # RSI Analysis
-        if 'RSI_14' in df.columns:
-            rsi = df['RSI_14'].iloc[-1]
-            status = "OVERSOLD 🚨" if rsi < 30 else "OVERBOUGHT ⚠️" if rsi > 70 else "Neutral"
-            message.append(f"📊 *RSI (14):* {rsi:.1f} - {status}")
-            
-        # MACD Analysis
-        if 'MACD_12_26_9' in df.columns:
-            macd = df['MACD_12_26_9'].iloc[-1]
-            signal = df['MACDs_12_26_9'].iloc[-1]
-            trend = "Bullish 🟢" if macd > signal else "Bearish 🔴"
-            message.append(f"📉 *MACD:* {macd:.4f} | Signal: {signal:.4f} - {trend}")
-            
-        # Volume Analysis
-        if 'OBV' in df.columns:
-            obv_trend = "Upward" if df['OBV'].iloc[-1] > df['OBV'].iloc[-2] else "Downward"
-            message.append(f"💹 *Volume Trend:* {obv_trend}")
-            
-        message.append("\n⚠️ *Disclaimer:* This is not financial advice. Always do your own research.")
-        
-        return "\n".join(message)
+        # Next market close (assume daily close at 00:00 UTC)
+        now_utc = datetime.utcnow()
+        tomorrow_utc = now_utc + timedelta(days=1)
+        next_close = datetime(tomorrow_utc.year, tomorrow_utc.month, tomorrow_utc.day, 0, 0, 0)
+        time_to_close = next_close - now_utc
+        hours_to_close = time_to_close.total_seconds() / 3600
+
+        message = (
+            f"👋 *Market Update for {symbol}*\n\n"
+            f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+            f"💰 *Current Price:* ${current_price:.2f}\n"
+            f"📈 *Intraday High:* ${intraday_high:.2f} | *Intraday Low:* ${intraday_low:.2f}\n"
+            f"⏳ *Next Daily Close (UTC):* {next_close.strftime('%Y-%m-%d %H:%M')} (in {hours_to_close:.1f} hrs)\n\n"
+            "🔍 *Technical Indicators:*\n"
+            f"- RSI (14): {rsi:.1f} " +
+                ("(Oversold <30)" if rsi < 30 else ("(Overbought >70)" if rsi > 70 else "(Neutral)")) + "\n"
+            f"- MACD: {'Bullish' if macd_bullish else 'Bearish'}\n"
+            f"- EMA 50 vs EMA 200: {'Bullish' if ema_trend else 'Bearish'} (Trend: *{trend}*)\n"
+            f"- ATR (14): " + (f"${atr:.2f}" if atr else "N/A") + "\n"
+            f"- Bollinger Band Width: ${df['BB_width'].iloc[-1]:.2f}\n\n"
+            "🔑 *Support & Resistance Levels:*\n"
+            f"   - *Current Price:* ${sr_levels['current_price']:.2f}\n"
+            "   - *Supports:* " + (", ".join([f"${s:.2f}" for s in sr_levels.get('support', [])]) or "-") + "\n"
+            "   - *Resistances:* " + (", ".join([f"${r:.2f}" for r in sr_levels.get('resistance', [])]) or "-") + "\n\n"
+            "📉 *Risk Management Settings:*\n"
+            f"- Risk Reward Ratio: {TRADING_PARAMS['RISK_REWARD_RATIO']}\n"
+            f"- Stop Loss ATR Multiplier: {TRADING_PARAMS['STOP_LOSS_ATR_MULTIPLIER']}\n\n"
+        )
+        if fib_levels is None:
+            fib_levels = df.attrs.get('fib_levels', None)
+        if fib_levels:
+            message += "*Fibonacci Retracement Levels (Last 100 Periods):*\n"
+            for key, level in fib_levels.items():
+                message += f"- {key}: ${level:.2f}\n"
+            message += "\n"
+        message += (
+            "🤖 *Ensemble Price Prediction:*\n"
+            "   - Check your Telegram for the latest prediction update!\n\n"
+            "💬 *Sentiment Analysis:* (in progress...)\n\n"
+            "⚠️ *Disclaimer:* This is for educational purposes only. Trade responsibly!\n\n"
+            "🚀 *Stay informed, stay ahead, and trade smart!*"
+        )
+        return message
     except Exception as e:
-        debug_print(f"Insight error: {str(e)}", level="error")
+        debug_print(f"Insight generation failed: {str(e)}", "error")
         return f"⚠️ Error generating insights for {symbol}"
+
+def tuned_stacking_prediction(df, symbol):
+    """
+    Use an ensemble stacking approach with grid search tuning and extra features
+    to predict the future price. Returns predicted price, RMSE, previous accuracy (if any), and trend.
+    """
+    try:
+        if df.empty or len(df) < 50:
+            debug_print("Not enough data for prediction", "error")
+            return None, None, None, None
+
+        df = df.copy()
+        # Basic feature engineering
+        df['Return'] = df['close'].pct_change()
+        df['MA_50'] = df['close'].rolling(window=50).mean()
+        df['MA_200'] = df['close'].rolling(window=200).mean()
+        df['RSI'] = ta.rsi(df['close'], length=14)
+        macd_df = ta.macd(df['close'])
+        df['MACD'] = macd_df['MACD_12_26_9']
+        df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+        # Extra technical indicators:
+        df['OBV'] = ta.obv(df['close'], df['volume'])
+        adx_df = ta.adx(df['high'], df['low'], df['close'])
+        df['ADX'] = adx_df['ADX_14']
+        # Add extra indicators (Fibonacci, Ichimoku, Pivot Points)
+        df, fib_levels = add_extra_indicators(df)
+        df = df.dropna()
+
+        features = ['Return', 'MA_50', 'MA_200', 'RSI', 'MACD', 'ATR', 'OBV', 'ADX']
+        target = 'close'
+
+        if len(df) < ML_PARAMS['PREDICTION_HORIZON'] + 1:
+            debug_print("Not enough data points after feature calculation", "error")
+            return None, None, None, None
+
+        # Determine trend from MA_50 vs MA_200
+        ema_trend = df['MA_50'].iloc[-1] > df['MA_200'].iloc[-1]
+        trend = "Upward" if ema_trend else "Downward"
+
+        X = df[features][:-ML_PARAMS['PREDICTION_HORIZON']]
+        y = df[target].shift(-ML_PARAMS['PREDICTION_HORIZON'])[:-ML_PARAMS['PREDICTION_HORIZON']]
+        if X.empty or y.empty:
+            debug_print("Empty features or target for prediction", "error")
+            return None, None, None, None
+
+        split_index = int(len(X) * ML_PARAMS['TRAIN_TEST_SPLIT'])
+        X_train, X_test = X.iloc[:split_index], X.iloc[split_index:]
+        y_train, y_test = y.iloc[:split_index], y.iloc[split_index:]
+
+        rf = RandomForestRegressor(random_state=42)
+        xgb = XGBRegressor(random_state=42, objective='reg:squarederror')
+
+        if ML_PARAMS['TUNE_MODEL']:
+            param_grid_rf = {'n_estimators': [100, 200], 'max_depth': [None, 10, 20]}
+            grid_rf = GridSearchCV(rf, param_grid_rf, cv=3, scoring='neg_mean_squared_error')
+            grid_rf.fit(X_train, y_train)
+            rf = grid_rf.best_estimator_
+
+            param_grid_xgb = {'n_estimators': [100, 200], 'max_depth': [3, 5, 7]}
+            grid_xgb = GridSearchCV(xgb, param_grid_xgb, cv=3, scoring='neg_mean_squared_error')
+            grid_xgb.fit(X_train, y_train)
+            xgb = grid_xgb.best_estimator_
+
+        estimators = [
+            ('rf', rf),
+            ('xgb', xgb)
+        ]
+        stacking_model = StackingRegressor(
+            estimators=estimators,
+            final_estimator=RandomForestRegressor(n_estimators=50, random_state=42)
+        )
+        stacking_model.fit(X_train, y_train)
+        y_pred = stacking_model.predict(X_test)
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+
+        future_features = df[features].iloc[-1].to_frame().T
+        future_price = stacking_model.predict(future_features)[0]
+
+        history = {}
+        if os.path.exists(PREDICTION_HISTORY_FILE):
+            try:
+                with open(PREDICTION_HISTORY_FILE, "r") as f:
+                    history = json.load(f)
+            except Exception:
+                debug_print("Failed to decode prediction history. Resetting.", "warning")
+                history = {}
+        if symbol in history and history[symbol].get("predicted_price") is not None and history[symbol].get("actual_price") is not None:
+            last_predicted = history[symbol]["predicted_price"]
+            last_actual = history[symbol]["actual_price"]
+            accuracy = 100 - (abs(last_predicted - last_actual) / last_actual * 100)
+        else:
+            accuracy = None
+
+        history[symbol] = {
+            "predicted_price": future_price,
+            "actual_price": None,
+            "timestamp": datetime.now().isoformat()
+        }
+        with open(PREDICTION_HISTORY_FILE, "w") as f:
+            json.dump(history, f)
+
+        return future_price, rmse, accuracy, trend
+    except Exception as e:
+        debug_print(f"Ensemble price prediction failed: {str(e)}", "error")
+        return None, None, None, None
+
+def analyze_sentiment(text):
+    from textblob import TextBlob
+    try:
+        blob = TextBlob(text)
+        polarity = blob.sentiment.polarity
+        sentiment = "Positive" if polarity > 0 else "Negative" if polarity < 0 else "Neutral"
+        return sentiment, polarity
+    except Exception as e:
+        debug_print(f"Sentiment analysis failed: {str(e)}", "error")
+        return None, None
 
 def send_telegram_message(text, image=None):
     try:
+        if not TELEGRAM.get('token') or not TELEGRAM.get('chat_id'):
+            debug_print("Telegram credentials missing", "error")
+            return False
         if image:
             url = f"https://api.telegram.org/bot{TELEGRAM['token']}/sendPhoto"
-            files = {'photo': image}
-            data = {'chat_id': TELEGRAM['chat_id'], 'caption': text[:900], 'parse_mode': 'Markdown'}
+            files = {'photo': ('chart.png', image.getvalue(), 'image/png')}
+            data = {
+                'chat_id': TELEGRAM['chat_id'],
+                'caption': text[:1024],
+                'parse_mode': 'Markdown'
+            }
             response = requests.post(url, files=files, data=data)
         else:
             url = f"https://api.telegram.org/bot{TELEGRAM['token']}/sendMessage"
-            data = {'chat_id': TELEGRAM['chat_id'], 'text': text, 'parse_mode': 'Markdown'}
+            data = {
+                'chat_id': TELEGRAM['chat_id'],
+                'text': text[:4096],
+                'parse_mode': 'Markdown'
+            }
             response = requests.post(url, json=data)
-            
-        response.raise_for_status()
+        if response.status_code != 200:
+            debug_print(f"Telegram API error: {response.text}", "error")
+            return False
         return True
     except Exception as e:
-        debug_print(f"Telegram error: {str(e)}", level="error")
+        debug_print(f"Telegram communication failed: {str(e)}", "error")
         return False
