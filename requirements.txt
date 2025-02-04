@@ -1,20 +1,21 @@
-# Core dependencies
-pandas==2.0.3
-numpy==1.24.4
+# Core Data Analysis
+pandas==1.5.3
+numpy==1.26.4
 pandas-ta==0.3.14b0
-scikit-learn==1.2.2
-xgboost==1.7.5
 
-# Data collection & processing
-requests==2.31.0
+# Machine Learning
+scikit-learn==1.3.0
+xgboost==2.1.3
+
+# API & Utilities
+requests==2.32.3
 python-dotenv==1.0.0
 
 # Visualization
-matplotlib==3.7.1
+matplotlib==3.10.0
 
-# NLP/Sentiment
-textblob==0.17.1
-nltk==3.8.1
+# NLP
+nltk==3.9.1
 
-# Additional financial analysis
-TA-Lib==0.4.28  # Make sure to include this for technical analysis
+# TA-Lib (commented out as not installed locally)
+# TA-Lib==0.4.28
